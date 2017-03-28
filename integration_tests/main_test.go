@@ -177,7 +177,7 @@ func TestWorkflow(t *testing.T) {
 		Name(bundleName).
 		Do().
 		Into(&bundleRes))
-	require.Equal(t, smith.READY, bundleRes.Status.State, "%#v", bundleRes)
+	require.Equal(t, smith.Ready, bundleRes.Status.State, "%#v", bundleRes)
 	require.Equal(t, bundle.Spec, bundleRes.Spec, "%#v", bundleRes)
 }
 

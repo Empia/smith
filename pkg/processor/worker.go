@@ -11,6 +11,7 @@ import (
 	"github.com/atlassian/smith/pkg/resources"
 
 	"github.com/cenk/backoff"
+	apiv1 "k8s.io/client-go/pkg/api/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
@@ -45,11 +46,8 @@ func (wrk *worker) rebuildLoop() {
 		if bundle == nil {
 			return
 		}
-		err := wrk.rebuild(bundle)
-		if err == nil {
-			wrk.bo.Reset() // reset the backoff on successful rebuild
-			// Make sure bundle does not need to be rebuilt before exiting goroutine by doing one more iteration
-		} else if !wrk.handleError(bundle, err) {
+		isReady, retriable, err := wrk.rebuild(bundle)
+		if !wrk.handleRebuildResult(bundle, isReady, retriable, err) {
 			return
 		}
 	}
@@ -63,11 +61,7 @@ func (wrk *worker) rebuildLoop() {
 // READY state might mean something different for each resource type. For ThirdPartyResources it may mean
 // that a field "State" in the Status of the resource is set to "Ready". It may be customizable via
 // annotations with some defaults.
-func (wrk *worker) rebuild(bundle *smith.Bundle) error {
-	if bundle.Status.State == smith.TERMINAL_ERROR {
-		// Sad, but true.
-		return nil
-	}
+func (wrk *worker) rebuild(bundle *smith.Bundle) (isReady, retriableError bool, e error) {
 	log.Printf("[WORKER] Rebuilding the bundle %s/%s", wrk.namespace, wrk.bundleName)
 
 	// Build resource map by name
@@ -79,7 +73,7 @@ func (wrk *worker) rebuild(bundle *smith.Bundle) error {
 	// Build the graph and topologically sort it
 	graphData, sortErr := graph.TopologicalSort(bundle)
 	if sortErr != nil {
-		return sortErr
+		return false, false, sortErr
 	}
 
 	readyResources := make(map[smith.ResourceName]*unstructured.Unstructured, len(bundle.Spec.Resources))
@@ -89,7 +83,7 @@ func (wrk *worker) rebuild(bundle *smith.Bundle) error {
 nextVertex:
 	for _, v := range graphData.SortedVertices {
 		if wrk.checkNeedsRebuild() {
-			return nil
+			return false, false, nil
 		}
 
 		// Check if all resource dependencies are ready (so we can start processing this one)
@@ -105,11 +99,11 @@ nextVertex:
 		res := resourceMap[v]
 		resClone, err := wrk.bp.scheme.DeepCopy(&res)
 		if err != nil {
-			return err
+			return false, false, err
 		}
-		readyResource, err := wrk.checkResource(bundle, resClone.(*smith.Resource), readyResources)
+		readyResource, retriable, err := wrk.checkResource(bundle, resClone.(*smith.Resource), readyResources)
 		if err != nil {
-			return err
+			return false, retriable, err
 		}
 		log.Printf("[WORKER] bundle %s/%s: resource %q, ready: %t", wrk.namespace, wrk.bundleName, v, readyResource != nil)
 		if readyResource != nil {
@@ -118,35 +112,27 @@ nextVertex:
 			allReady = false
 		}
 	}
-
-	// Updating the bundle state
-	if allReady {
-		return wrk.setBundleState(bundle, smith.READY)
-	}
-	if err := wrk.setBundleState(bundle, smith.IN_PROGRESS); err != nil {
-		log.Printf("[WORKER] %v", err)
-	}
-	return nil
+	return allReady, false, nil
 }
 
-func (wrk *worker) checkResource(bundle *smith.Bundle, res *smith.Resource, readyResources map[smith.ResourceName]*unstructured.Unstructured) (readyResource *unstructured.Unstructured, e error) {
+func (wrk *worker) checkResource(bundle *smith.Bundle, res *smith.Resource, readyResources map[smith.ResourceName]*unstructured.Unstructured) (readyResource *unstructured.Unstructured, retriableError bool, e error) {
 	// 1. Eval spec
 	if err := wrk.evalSpec(bundle, res, readyResources); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	// 2. Create or update resource
-	resUpdated, err := wrk.createOrUpdate(res)
+	resUpdated, retriable, err := wrk.createOrUpdate(res)
 	if err != nil || resUpdated == nil {
-		return nil, err
+		return nil, retriable, err
 	}
 
 	// 3. Check if resource is ready
-	ready, err := wrk.bp.rc.IsReady(resUpdated)
+	ready, retriable, err := wrk.bp.rc.IsReady(resUpdated)
 	if err != nil || !ready {
-		return nil, err
+		return nil, retriable, err
 	}
-	return resUpdated, nil
+	return resUpdated, false, nil
 }
 
 // Mutates spec in place.
@@ -176,17 +162,17 @@ func (wrk *worker) evalSpec(bundle *smith.Bundle, res *smith.Resource, readyReso
 	return nil
 }
 
-func (wrk *worker) createOrUpdate(res *smith.Resource) (*unstructured.Unstructured, error) {
+func (wrk *worker) createOrUpdate(res *smith.Resource) (resUpdated *unstructured.Unstructured, retriableError bool, e error) {
 	// 1. Prepare client
 	gv, err := schema.ParseGroupVersion(res.Spec.GetAPIVersion())
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	kind := res.Spec.GetKind()
 	gvk := gv.WithKind(kind)
 	client, err := wrk.bp.clients.ClientForGroupVersionKind(gvk)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	resClient := client.Resource(&metav1.APIResource{
@@ -199,7 +185,7 @@ func (wrk *worker) createOrUpdate(res *smith.Resource) (*unstructured.Unstructur
 	obj, exists, err := wrk.bp.store.Get(gvk, wrk.namespace, res.Spec.GetName())
 	if err != nil {
 		// Unexpected error
-		return nil, err
+		return nil, true, err
 	}
 	var response *unstructured.Unstructured
 	if exists {
@@ -211,7 +197,7 @@ func (wrk *worker) createOrUpdate(res *smith.Resource) (*unstructured.Unstructur
 			}
 			if err = converter.ToUnstructured(obj, &response.Object); err != nil {
 				// Unexpected error
-				return nil, err
+				return nil, false, err
 			}
 		}
 	} else {
@@ -220,26 +206,26 @@ func (wrk *worker) createOrUpdate(res *smith.Resource) (*unstructured.Unstructur
 		response, err = resClient.Create(&res.Spec)
 		if err == nil {
 			log.Printf("[WORKER] bundle %s/%s: resource %q created", wrk.namespace, wrk.bundleName, res.Name)
-			return response, nil
+			return response, false, nil
 		}
 		if errors.IsAlreadyExists(err) {
 			log.Printf("[WORKER] bundle %s/%s: resource %q found, but not in Store yet", wrk.namespace, wrk.bundleName, res.Name)
 			// We let the next rebuild() iteration, triggered by someone else creating the resource, to finish the work.
-			return nil, nil
+			return nil, false, nil
 		}
-		// Unexpected error
-		return nil, err
+		// Unexpected error, will retry
+		return nil, true, err
 	}
 
 	// 4. Compare spec and existing resource
 	updated, err := updateResource(wrk.bp.scheme, res, response)
 	if err != nil {
 		// Unexpected error
-		return nil, err
+		return nil, false, err
 	}
 	if updated == nil {
 		log.Printf("[WORKER] bundle %s/%s: resource %q has correct spec", wrk.namespace, wrk.bundleName, res.Name)
-		return response, nil
+		return response, false, nil
 	}
 
 	// 5. Update if different
@@ -248,28 +234,24 @@ func (wrk *worker) createOrUpdate(res *smith.Resource) (*unstructured.Unstructur
 		if errors.IsConflict(err) {
 			log.Printf("[WORKER] bundle %s/%s: resource %q update resulted in conflict, restarting loop", wrk.namespace, wrk.bundleName, res.Name)
 			// We let the next rebuild() iteration, triggered by someone else creating the resource, to finish the work.
-			return nil, nil
+			return nil, false, nil
 		}
-		// Unexpected error
-		return nil, err
+		// Unexpected error, will retry
+		return nil, true, err
 	}
 	log.Printf("[WORKER] bundle %s/%s: resource %q updated", wrk.namespace, wrk.bundleName, res.Name)
-	return response, nil
+	return response, false, nil
 }
 
-func (wrk *worker) setBundleState(tpl *smith.Bundle, desired smith.ResourceState) error {
-	if tpl.Status.State == desired {
-		return nil
-	}
-	log.Printf("[WORKER] setting bundle %s/%s State to %q from %q", wrk.namespace, wrk.bundleName, desired, tpl.Status.State)
-	tpl.Status.State = desired
+func (wrk *worker) setBundleStatus(bundle *smith.Bundle) error {
+	log.Printf("[WORKER] setting bundle %s/%s status to %v", wrk.namespace, wrk.bundleName, bundle.Status)
 	err := wrk.bp.bundleClient.Put().
 		Namespace(wrk.namespace).
 		Resource(smith.BundleResourcePath).
 		Name(wrk.bundleName).
-		Body(tpl).
+		Body(bundle).
 		Do().
-		Into(tpl)
+		Into(bundle)
 	if err != nil {
 		if kerrors.IsConflict(err) {
 			// Something updated the bundle concurrently.
@@ -279,9 +261,8 @@ func (wrk *worker) setBundleState(tpl *smith.Bundle, desired smith.ResourceState
 			// It is safe to ignore this conflict because we will reiterate because of the update event.
 			return nil
 		}
-		return fmt.Errorf("failed to set bundle %s/%s state to %q: %v", wrk.namespace, wrk.bundleName, desired, err)
+		return fmt.Errorf("failed to set bundle %s/%s status to %v: %v", wrk.namespace, wrk.bundleName, bundle.Status, err)
 	}
-	log.Printf("[WORKER] bundle %s/%s is %q", wrk.namespace, wrk.bundleName, desired)
 	return nil
 }
 
@@ -309,14 +290,90 @@ func (wrk *worker) cleanupState() {
 	}
 }
 
-func (wrk *worker) handleError(bundle *smith.Bundle, err error) (shouldContinue bool) {
+func (wrk *worker) handleRebuildResult(bundle *smith.Bundle, isReady, retriableError bool, err error) (shouldContinue bool) {
 	if err == context.Canceled || err == context.DeadlineExceeded {
 		return false
+	}
+	var inProgressCond, readyCond, errorCond smith.BundleCondition
+	if err == nil {
+		wrk.bo.Reset() // reset the backoff on successful rebuild
+		// Make sure bundle does not need to be rebuilt before exiting goroutine by doing one more iteration
+		errorCond = smith.BundleCondition{
+			Type:smith.BundleError,
+			Status:apiv1.ConditionFalse,
+		}
+		if isReady {
+			inProgressCond = smith.BundleCondition{
+				Type:smith.BundleInProgress,
+				Status:apiv1.ConditionFalse,
+			}
+			readyCond = smith.BundleCondition{
+				Type:smith.BundleReady,
+				Status:apiv1.ConditionTrue,
+			}
+		} else {
+			inProgressCond = smith.BundleCondition{
+				Type:smith.BundleInProgress,
+				Status:apiv1.ConditionTrue,
+			}
+			readyCond = smith.BundleCondition{
+				Type:smith.BundleReady,
+				Status:apiv1.ConditionFalse,
+			}
+		}
+	} else {
+		readyCond = smith.BundleCondition{
+			Type:smith.BundleReady,
+			Status:apiv1.ConditionFalse,
+		}
+		if retriableError {
+			errorCond = smith.BundleCondition{
+				Type:smith.BundleError,
+				Status:apiv1.ConditionTrue,
+				Reason: "RetriableError",
+				Message: err.Error(),
+			}
+			inProgressCond = smith.BundleCondition{
+				Type:smith.BundleInProgress,
+				Status:apiv1.ConditionTrue,
+			}
+		} else {
+			errorCond = smith.BundleCondition{
+				Type:smith.BundleError,
+				Status:apiv1.ConditionTrue,
+				Reason: "TerminalError",
+				Message: err.Error(),
+			}
+			inProgressCond = smith.BundleCondition{
+				Type:smith.BundleInProgress,
+				Status:apiv1.ConditionFalse,
+			}
+		}
+	}
+
+	inProgressUpdated := bundle.UpdateCondition(&inProgressCond)
+	readyUpdated := bundle.UpdateCondition(&readyCond)
+	errorUpdated := bundle.UpdateCondition(&errorCond)
+
+
+	// Updating the bundle state
+	if allReady {
+		return true, wrk.setBundleStatus(bundle, smith.BundleStatusFromConditions(smith.BundleCondition{
+			Type: smith.BundleReady,
+			Status:apiv1.ConditionTrue,
+			LastUpdateTime: metav1.Now(),
+			LastTransitionTime: metav1.Now(),
+			Reason: "",
+
+		}))
+	}
+	if err := wrk.setBundleStatus(bundle, smith.InProgress); err != nil {
+		log.Printf("[WORKER] %v", err)
 	}
 	log.Printf("[WORKER] Failed to rebuild the bundle %s/%s: %v", wrk.namespace, wrk.bundleName, err)
 	next := wrk.bo.NextBackOff()
 	if next == backoff.Stop {
-		if e := wrk.setBundleState(bundle, smith.TERMINAL_ERROR); e != nil {
+		if e := wrk.setBundleStatus(bundle, smith.TerminalError); e != nil {
 			log.Printf("[WORKER] %v", e)
 		}
 		return false
@@ -328,7 +385,7 @@ func (wrk *worker) handleError(bundle *smith.Bundle, err error) (shouldContinue 
 			wrk.bundle = bundle // Need to re-initialize wrk.bundle so that external loop continues to run
 		}
 	}()
-	if e := wrk.setBundleState(bundle, smith.ERROR); e != nil {
+	if e := wrk.setBundleStatus(bundle, smith.Error); e != nil {
 		log.Printf("[WORKER] %v", e)
 	}
 	after := time.NewTimer(next)

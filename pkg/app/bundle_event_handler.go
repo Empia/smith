@@ -14,10 +14,12 @@ type bundleEventHandler struct {
 }
 
 func (h *bundleEventHandler) OnAdd(obj interface{}) {
+	// TODO remove bundle state.
 	h.handle(obj)
 }
 
 func (h *bundleEventHandler) OnUpdate(oldObj, newObj interface{}) {
+	// TODO remove bundle state if it is TerminalError and if there is a change to the Bundle spec.
 	h.handle(newObj)
 }
 

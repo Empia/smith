@@ -147,7 +147,7 @@ func TestTprAttribute(t *testing.T) {
 				assert.EqualValues(t, map[string]string{
 					smith.BundleNameLabel: bundleName,
 				}, obj.Metadata.Labels)
-				if obj.Status.State == tprattribute.AWAKE {
+				if obj.Status.State == tprattribute.Awake {
 					return
 				}
 			}
@@ -161,7 +161,7 @@ func TestTprAttribute(t *testing.T) {
 		Name(bundleName).
 		Do().
 		Into(&bundleRes))
-	require.Equal(t, smith.READY, bundleRes.Status.State)
+	require.Equal(t, smith.Ready, bundleRes.Status.State)
 }
 
 func bundleAttrResources(t *testing.T) (*tprattribute.Sleeper, *unstructured.Unstructured) {
